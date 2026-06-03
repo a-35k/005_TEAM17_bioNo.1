@@ -1,0 +1,204 @@
+import pandas as pd
+import streamlit as st
+import pydeck as pdk
+
+SEAFOOD_LIST = ["연어", "고등어"]
+
+RANK_COLORS = {
+    1: [120, 30, 30, 220],
+    2: [160, 50, 50, 200],
+    3: [200, 80, 80, 180],
+    4: [220, 120, 120, 160],
+    5: [240, 160, 160, 140],
+}
+
+COUNTRY_CENTROIDS = {
+    "JP": (36.2048, 138.2529),
+    "CN": (35.8617, 104.1954),
+    "US": (37.0902, -95.7129),
+    "RU": (61.5240, 105.3188),
+    "VN": (14.0583, 108.2772),
+    "TH": (15.8700, 100.9925),
+    "NO": (60.4720, 8.4689),
+    "CL": (-35.6751, -71.5430),
+    "PE": (-9.1900, -75.0152),
+    "CA": (56.1304, -106.3468),
+    "AU": (-25.2744, 133.7751),
+}
+
+# -----------------------
+# CSV 로딩/정리
+# -----------------------
+def read_csv_robust(uploaded_file) -> pd.DataFrame:
+    """한글 깨짐 방지: utf-8-sig / cp949 순서로 시도"""
+    for enc in ("utf-8-sig", "cp949"):
+        try:
+            return pd.read_csv(uploaded_file, encoding=enc)
+        except UnicodeDecodeError:
+            uploaded_file.seek(0)
+    raise UnicodeDecodeError("CSV 인코딩을 utf-8-sig/cp949로 읽지 못했습니다.", b"", 0, 1, "encoding error")
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """컬럼명 공백/BOM 제거"""
+    df = df.copy()
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+    return df
+
+
+def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """후보 컬럼명 중 실제로 존재하는 첫 컬럼 반환"""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def coerce_numeric(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    """숫자 변환"""
+    df = df.copy()
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def attach_latlon(top_df: pd.DataFrame, code_col: str) -> pd.DataFrame:
+    """국가코드(ISO2) 기반 위경도 부착"""
+    df = top_df.copy()
+
+    def get_latlon(code: str):
+        code = str(code).strip().upper()
+        return COUNTRY_CENTROIDS.get(code)
+
+    latlon = df[code_col].apply(get_latlon)
+    df["lat"] = latlon.apply(lambda x: x[0] if x else None)
+    df["lon"] = latlon.apply(lambda x: x[1] if x else None)
+    return df.dropna(subset=["lat", "lon"])
+
+
+# -----------------------
+# 핵심 분석
+# -----------------------
+def filter_import_rows(df: pd.DataFrame, trade_col: str | None) -> pd.DataFrame:
+    """수입(I)만 남김 (해당 컬럼이 없으면 그대로 반환)"""
+    if not trade_col:
+        return df
+    d = df.copy()
+    return d[d[trade_col].astype(str).str.strip().eq("I")]
+
+
+def top5_by_country(df: pd.DataFrame, code_col: str, name_col: str, metric_col: str) -> pd.DataFrame:
+    """국가별 metric 합계로 TOP5 산출"""
+    out = (df.groupby([code_col, name_col], dropna=False)[metric_col]
+             .sum(min_count=1)
+             .reset_index()
+             .sort_values(metric_col, ascending=False)
+             .head(5)
+             .reset_index(drop=True))
+    out["순위"] = range(1, len(out) + 1)
+    return out
+
+
+def render_world_map(points_df: pd.DataFrame, name_col: str, metric_col: str):
+    """세계지도 점 표시(순위별 색 진함)"""
+    if points_df.empty:
+        st.info("지도에 표시할 국가 좌표가 없습니다(국가코드-좌표 매칭이 필요).")
+        return
+
+    d = points_df.copy()
+    d["color"] = d["순위"].apply(lambda r: RANK_COLORS.get(int(r), [100, 100, 100, 120]))
+
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=d,
+        get_position=["lon", "lat"],
+        get_radius=250000,
+        radius_min_pixels=6,
+        radius_max_pixels=30,
+        get_fill_color="color",
+        pickable=True,
+    )
+
+    tooltip = {
+        "html": f"<b>{{{name_col}}}</b><br/>순위: {{순위}}<br/>{metric_col}: {{{metric_col}}}",
+        "style": {"backgroundColor": "white", "color": "black"},
+    }
+
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=[layer],
+            initial_view_state=pdk.ViewState(latitude=20, longitude=0, zoom=1),
+            tooltip=tooltip,
+        )
+    )
+
+
+# -----------------------
+# Streamlit App
+# -----------------------
+def main():
+    st.set_page_config(page_title="수산물 수입 국가 분석", layout="wide")
+    st.title("수산물별 수입 국가 분석 프로그램")
+
+    uploaded = st.file_uploader("CSV 파일 업로드", type=["csv"])
+    if not uploaded:
+        st.stop()
+
+    df = normalize_columns(read_csv_robust(uploaded))
+
+    # 원본 미리보기(접었다 펼 수 있게 + 상위 5행)
+    with st.expander("원본 파일 내용 확인(상위 5행)", expanded=False):
+        st.text(df.head(5).to_csv(index=False))
+
+    # 컬럼 자동 매핑 (데이터셋별 명칭 차이를 흡수)
+    item_col = pick_col(df, ["품목", "품목명", "수산물명", "품목명칭"])
+    code_col = pick_col(df, ["국가코드", "국가코드값", "국가코드(ISO2)"])
+    name_col = pick_col(df, ["국가명", "국가"])
+    trade_col = pick_col(df, ["수출입구분코드", "수출입구분"])
+
+    # metric 후보: 사용자식/해양수산부식 둘 다 지원
+    metric_col = pick_col(df, [
+        "수입금액", "수입중량",
+        "당월수출입미화금액(달러)", "당월수출입중량(킬로그램)"
+    ])
+    if not (code_col and name_col and metric_col):
+        st.error(
+            "필수 컬럼이 없습니다.\n"
+            f"- 필요: 국가코드/국가명/수입금액(또는 중량)\n"
+            f"- 탐지 결과: 국가코드={code_col}, 국가명={name_col}, 지표={metric_col}, 품목={item_col}\n\n"
+            "CSV 헤더(컬럼명) 한 줄을 보내주시면 정확히 맞춰드릴 수 있습니다."
+        )
+        st.stop()
+
+    df = coerce_numeric(df, metric_col)
+    df = filter_import_rows(df, trade_col)
+
+    left, right = st.columns([1, 2])
+
+    with left:
+        st.subheader("분석 조건")
+
+        # 품목 컬럼이 있으면 “연어/고등어” 선택을 활성화
+        if item_col:
+            seafood = st.radio("수산물 선택", SEAFOOD_LIST)
+            d = df[df[item_col].astype(str).str.contains(seafood, na=False)].copy()
+            st.caption(f"품목 컬럼: {item_col}")
+        else:
+            d = df.copy()
+            st.warning("업로드한 CSV에 품목(연어/고등어 등) 컬럼이 없어 '수산물 전체' 기준으로만 분석합니다.")
+
+        st.caption(f"지표 컬럼: {metric_col} (수입만 집계)")
+
+    with right:
+        st.subheader("국가별 수입 상위 5개국")
+
+        top5 = top5_by_country(d, code_col, name_col, metric_col)
+        st.dataframe(top5[[c for c in ["순위", code_col, name_col, metric_col] if c in top5.columns]],
+                     use_container_width=True)
+
+        points = attach_latlon(top5, code_col)
+        render_world_map(points, name_col, metric_col)
+
+        st.caption("순위 색상: 1위가 가장 진하고, 5위로 갈수록 연해집니다.")
+
+if __name__ == "__main__":
+    main()
